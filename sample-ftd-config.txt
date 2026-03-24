@@ -1,0 +1,312 @@
+: Saved
+
+: Serial Number: FTD-LAB-9300-01
+: Hardware:   FPR-9300, 32768 MB RAM, CPU Xeon E5-2600 series 2100 MHz, 2 CPUs (16 cores)
+
+ASA Version 9.18(2)
+!
+hostname FTD-EDGE-FW01
+domain-name lab.local
+enable password $sha512$rounds=5000$abc123 level 15
+!
+interface GigabitEthernet0/0
+ nameif OUTSIDE
+ security-level 0
+ ip address 203.0.113.1 255.255.255.0
+!
+interface GigabitEthernet0/1
+ nameif INSIDE
+ security-level 100
+ ip address 10.10.1.1 255.255.255.0
+!
+interface GigabitEthernet0/2
+ nameif DMZ
+ security-level 50
+ ip address 172.16.1.1 255.255.255.0
+!
+interface GigabitEthernet0/3
+ nameif MGMT
+ security-level 100
+ ip address 192.168.1.1 255.255.255.0
+ management-only
+!
+interface GigabitEthernet0/4
+ no nameif
+ no security-level
+ no ip address
+ shutdown
+!
+interface GigabitEthernet0/5
+ no nameif
+ no security-level
+ no ip address
+ shutdown
+!
+dns domain-lookup OUTSIDE
+dns server-group DefaultDNS
+ name-server 8.8.8.8
+ name-server 8.8.4.4
+!
+object network OBJ-INTERNAL-NET
+ subnet 10.10.1.0 255.255.255.0
+object network OBJ-DMZ-NET
+ subnet 172.16.1.0 255.255.255.0
+object network OBJ-WEBSERVER
+ host 172.16.1.10
+object network OBJ-MAILSERVER
+ host 172.16.1.20
+object network OBJ-DBSERVER
+ host 10.10.1.50
+object network OBJ-DNS-GOOGLE
+ host 8.8.8.8
+object network OBJ-ANY
+ subnet 0.0.0.0 0.0.0.0
+!
+object-group network DG-DMZ-SERVERS
+ network-object object OBJ-WEBSERVER
+ network-object object OBJ-MAILSERVER
+object-group network DG-INTERNAL-SERVERS
+ network-object object OBJ-DBSERVER
+object-group service DG-WEB-PORTS tcp
+ port-object eq www
+ port-object eq https
+object-group service DG-MAIL-PORTS tcp
+ port-object eq smtp
+ port-object eq 587
+ port-object eq 993
+!
+object-group network DG-LEGACY-HOSTS
+ description Old hosts - not in use
+ network-object host 10.10.1.200
+ network-object host 10.10.1.201
+ network-object host 10.10.1.202
+!
+! ============================================================
+! ACCESS LISTS
+! ============================================================
+!
+! --- OUTSIDE -> DMZ (allow web + mail to DMZ servers) ---
+access-list ACL-OUTSIDE-IN extended permit tcp any object-group DG-DMZ-SERVERS object-group DG-WEB-PORTS
+access-list ACL-OUTSIDE-IN extended permit tcp any object OBJ-MAILSERVER object-group DG-MAIL-PORTS
+!
+! --- BAD: Allow all ICMP from outside (security risk) ---
+access-list ACL-OUTSIDE-IN extended permit icmp any any
+!
+! --- INSIDE -> OUTSIDE (outbound) ---
+access-list ACL-INSIDE-OUT extended permit tcp object OBJ-INTERNAL-NET any eq www
+access-list ACL-INSIDE-OUT extended permit tcp object OBJ-INTERNAL-NET any eq https
+access-list ACL-INSIDE-OUT extended permit tcp object OBJ-INTERNAL-NET any eq domain
+access-list ACL-INSIDE-OUT extended permit udp object OBJ-INTERNAL-NET any eq domain
+!
+! --- BAD: Overly permissive rule — allows ALL traffic from inside ---
+access-list ACL-INSIDE-OUT extended permit ip any any
+!
+! --- DMZ -> INSIDE (should be very restricted) ---
+! --- BAD: DMZ can reach the DB server on ALL ports ---
+access-list ACL-DMZ-IN extended permit ip object OBJ-WEBSERVER object OBJ-DBSERVER
+!
+! --- BAD: Disabled ACL line left in config (forgotten) ---
+access-list ACL-DMZ-IN extended permit tcp any any eq 23
+!
+! --- MGMT access ---
+access-list ACL-MGMT extended permit tcp 192.168.1.0 255.255.255.0 host 192.168.1.1 eq ssh
+access-list ACL-MGMT extended permit tcp 192.168.1.0 255.255.255.0 host 192.168.1.1 eq https
+!
+! ============================================================
+! NAT RULES
+! ============================================================
+!
+object network OBJ-INTERNAL-NET
+ nat (INSIDE,OUTSIDE) dynamic interface
+object network OBJ-WEBSERVER
+ nat (DMZ,OUTSIDE) static 203.0.113.10
+object network OBJ-MAILSERVER
+ nat (DMZ,OUTSIDE) static 203.0.113.20
+!
+! --- BAD: DB server has a static NAT to outside (shouldn't be exposed) ---
+object network OBJ-DBSERVER
+ nat (INSIDE,OUTSIDE) static 203.0.113.50
+!
+! ============================================================
+! ACCESS GROUPS (bind ACLs to interfaces)
+! ============================================================
+!
+access-group ACL-OUTSIDE-IN in interface OUTSIDE
+access-group ACL-INSIDE-OUT in interface INSIDE
+access-group ACL-DMZ-IN in interface DMZ
+access-group ACL-MGMT in interface MGMT
+!
+! ============================================================
+! ROUTING
+! ============================================================
+!
+route OUTSIDE 0.0.0.0 0.0.0.0 203.0.113.254 1
+route INSIDE 10.10.0.0 255.255.0.0 10.10.1.254 1
+!
+! ============================================================
+! VPN — Site-to-Site
+! ============================================================
+!
+crypto ipsec ikev2 ipsec-proposal PROP-AES256
+ protocol esp encryption aes-256
+ protocol esp integrity sha-512
+!
+! --- BAD: Weak proposal still configured ---
+crypto ipsec ikev2 ipsec-proposal PROP-DES-LEGACY
+ protocol esp encryption des
+ protocol esp integrity md5
+!
+crypto ipsec security-association pmtu-aging infinite
+!
+crypto ikev2 policy 10
+ encryption aes-256
+ integrity sha512
+ group 21
+ prf sha512
+ lifetime seconds 86400
+!
+! --- BAD: Weak IKEv2 policy with DES + MD5 ---
+crypto ikev2 policy 99
+ encryption des
+ integrity md5
+ group 2
+ prf md5
+ lifetime seconds 86400
+!
+tunnel-group 198.51.100.1 type ipsec-l2l
+tunnel-group 198.51.100.1 ipsec-attributes
+ ikev2 remote-authentication pre-shared-key *****
+ ikev2 local-authentication pre-shared-key *****
+!
+! ============================================================
+! VPN — Remote Access (AnyConnect)
+! ============================================================
+!
+webvpn
+ enable OUTSIDE
+ anyconnect image disk0:/anyconnect-linux64-4.10.07073-webdeploy-k9.pkg 1
+ anyconnect enable
+ tunnel-group-list enable
+!
+group-policy GP-ANYCONNECT internal
+group-policy GP-ANYCONNECT attributes
+ vpn-tunnel-protocol ssl-client
+ split-tunnel-policy tunnelspecified
+ split-tunnel-network-list value SPLIT-TUNNEL-ACL
+ dns-server value 10.10.1.5
+ default-domain value lab.local
+!
+! --- BAD: No idle timeout configured ---
+tunnel-group TG-ANYCONNECT type remote-access
+tunnel-group TG-ANYCONNECT general-attributes
+ default-group-policy GP-ANYCONNECT
+ address-pool POOL-VPN
+tunnel-group TG-ANYCONNECT webvpn-attributes
+ group-alias "Lab VPN" enable
+!
+ip local pool POOL-VPN 10.10.200.1-10.10.200.254 mask 255.255.255.0
+!
+access-list SPLIT-TUNNEL-ACL extended permit ip 10.10.0.0 255.255.0.0 any
+!
+! ============================================================
+! LOGGING
+! ============================================================
+!
+! --- BAD: Logging level is only "errors" — misses warnings + notifications ---
+logging enable
+logging timestamp
+logging buffer-size 1048576
+logging buffered errors
+logging trap errors
+!
+! --- BAD: No syslog server configured ---
+! logging host INSIDE 10.10.1.100
+!
+! ============================================================
+! SSH / MANAGEMENT
+! ============================================================
+!
+! --- BAD: SSH allowed from ANY on INSIDE (should be restricted to mgmt subnet) ---
+ssh 0.0.0.0 0.0.0.0 INSIDE
+ssh 192.168.1.0 255.255.255.0 MGMT
+ssh timeout 30
+ssh version 2
+!
+! --- BAD: HTTP/ASDM management open on INSIDE to any ---
+http server enable
+http 0.0.0.0 0.0.0.0 INSIDE
+http 192.168.1.0 255.255.255.0 MGMT
+!
+aaa authentication ssh console LOCAL
+aaa authentication http console LOCAL
+!
+username admin password $sha512$rounds=5000$xyz789 privilege 15
+username readonly password $sha512$rounds=5000$def456 privilege 5
+!
+! ============================================================
+! NTP
+! ============================================================
+!
+! --- BAD: Using unauthenticated NTP ---
+ntp server 129.6.15.28
+ntp server 129.6.15.29
+!
+! ============================================================
+! SNMP
+! ============================================================
+!
+! --- BAD: SNMP v2c with default community string ---
+snmp-server community public
+snmp-server community private
+snmp-server location "Lab Datacenter"
+snmp-server contact "admin@lab.local"
+snmp-server enable traps
+!
+! ============================================================
+! THREAT DETECTION
+! ============================================================
+!
+threat-detection basic-threat
+threat-detection scanning-threat shun except ip-address 10.10.1.0 255.255.255.0
+threat-detection statistics access-list
+threat-detection statistics tcp-intercept rate-interval 30 burst-rate 400 average-rate 200
+!
+! ============================================================
+! MISCELLANEOUS
+! ============================================================
+!
+! --- BAD: Telnet still enabled on INSIDE ---
+telnet 10.10.1.0 255.255.255.0 INSIDE
+telnet timeout 5
+!
+banner login *** AUTHORIZED ACCESS ONLY — All activity is monitored ***
+!
+class-map inspection_default
+ match default-inspection-traffic
+!
+policy-map type inspect dns preset_dns_map
+ parameters
+  message-length maximum client auto
+  message-length maximum 512
+!
+policy-map global_policy
+ class inspection_default
+  inspect dns preset_dns_map
+  inspect ftp
+  inspect h323 h225
+  inspect h323 ras
+  inspect ip-options
+  inspect netbios
+  inspect rsh
+  inspect rtsp
+  inspect skinny
+  inspect esmtp
+  inspect sqlnet
+  inspect sunrpc
+  inspect tftp
+  inspect sip
+  inspect xdmcp
+!
+service-policy global_policy global
+!
+: end
