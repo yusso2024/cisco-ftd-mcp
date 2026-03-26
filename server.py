@@ -26,10 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cisco-ftd-mcp")
 
-mcp = FastMCP(
-    name="cisco-ftd-assessment",
-    version="0.1.0",
-)
+mcp = FastMCP(name="cisco-ftd-assessment")
 
 
 # =========================================================================
@@ -260,9 +257,12 @@ def _parse_interface(lines: list[str], start: int) -> dict:
              "shutdown": False, "management_only": False}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or (not line.startswith(" ") and not line.startswith("!") and i > start + 1
-                        and lines[i][0] not in (" ", "\t")):
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if _is_block_end(raw):
             break
         if line.startswith("nameif "):
             iface["nameif"] = line.split(None, 1)[1]
@@ -276,11 +276,20 @@ def _parse_interface(lines: list[str], start: int) -> dict:
             iface["shutdown"] = True
         elif line == "management-only":
             iface["management_only"] = True
-        elif line == "!" or (line and not line[0].isspace() and i > start + 1):
-            break
         i += 1
     iface["_end_line"] = i
     return iface
+
+
+def _is_indented(raw_line: str) -> bool:
+    return raw_line.startswith(" ") or raw_line.startswith("\t")
+
+
+def _is_block_end(raw_line: str) -> bool:
+    stripped = raw_line.strip()
+    if not stripped or stripped == "!":
+        return False
+    return not _is_indented(raw_line)
 
 
 def _parse_object_network(lines: list[str], start: int) -> dict:
@@ -288,10 +297,12 @@ def _parse_object_network(lines: list[str], start: int) -> dict:
     obj = {"name": name, "type": "network", "value": "", "nat": None}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or line == "!" or (line and not line[0].isspace() and not line.startswith("!")):
-            if line == "!":
-                i += 1
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if _is_block_end(raw):
             break
         if line.startswith("subnet "):
             obj["value"] = line[7:]
@@ -311,10 +322,12 @@ def _parse_object_group(lines: list[str], start: int) -> dict:
     grp = {"type": header_parts[1], "name": header_parts[2], "members": [], "description": ""}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or line == "!" or (line and not line[0].isspace()):
-            if line == "!":
-                i += 1
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if _is_block_end(raw):
             break
         if line.startswith("description "):
             grp["description"] = line.split(None, 1)[1]
@@ -373,10 +386,12 @@ def _parse_crypto_proposal(lines: list[str], start: int) -> dict:
     prop = {"name": name, "encryption": "", "integrity": ""}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or line == "!" or (line and not line[0].isspace()):
-            if line == "!":
-                i += 1
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if _is_block_end(raw):
             break
         if "encryption" in line:
             prop["encryption"] = line.split()[-1]
@@ -392,10 +407,12 @@ def _parse_ikev2_policy(lines: list[str], start: int) -> dict:
     policy = {"priority": priority, "encryption": "", "integrity": "", "dh_group": "", "prf": "", "lifetime": ""}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or line == "!" or (line and not line[0].isspace()):
-            if line == "!":
-                i += 1
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if _is_block_end(raw):
             break
         if line.startswith("encryption "):
             policy["encryption"] = line.split()[-1]
@@ -413,22 +430,29 @@ def _parse_ikev2_policy(lines: list[str], start: int) -> dict:
 
 
 def _parse_tunnel_group(lines: list[str], start: int) -> dict:
+    peer = lines[start].strip().split()[1]
     parts = lines[start].strip().split()
-    tg = {"peer": parts[1], "type": parts[3] if len(parts) > 3 else "", "attributes": {}}
+    tg = {"peer": peer, "type": parts[3] if len(parts) > 3 else "", "attributes": {}}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or line == "!" or (line.startswith("tunnel-group ") and i > start):
-            if line == "!":
-                i += 1
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if not _is_indented(raw) and not line.startswith(f"tunnel-group {peer}"):
             break
-        if "ipsec-attributes" in line or "general-attributes" in line or "webvpn-attributes" in line:
+        if line.startswith(f"tunnel-group {peer}") and ("ipsec-attributes" in line or "general-attributes" in line or "webvpn-attributes" in line):
             section = line.split()[-1]
             tg["attributes"][section] = []
             i += 1
             while i < len(lines):
-                attr_line = lines[i].strip()
-                if not attr_line or attr_line == "!" or (attr_line and not attr_line[0].isspace()):
+                attr_raw = lines[i]
+                attr_line = attr_raw.strip()
+                if not attr_line or attr_line == "!":
+                    i += 1
+                    continue
+                if _is_block_end(attr_raw):
                     break
                 tg["attributes"][section].append(attr_line)
                 i += 1
@@ -490,10 +514,12 @@ def _parse_group_policy_attrs(lines: list[str], start: int) -> dict:
     gp = {"name": name, "attributes": {}}
     i = start + 1
     while i < len(lines):
-        line = lines[i].strip()
-        if not line or line == "!" or (line and not line[0].isspace()):
-            if line == "!":
-                i += 1
+        raw = lines[i]
+        line = raw.strip()
+        if not line or line == "!":
+            i += 1
+            continue
+        if _is_block_end(raw):
             break
         parts = line.split(None, 1)
         if len(parts) == 2:
@@ -504,11 +530,17 @@ def _parse_group_policy_attrs(lines: list[str], start: int) -> dict:
 
 
 def _collect_nat_from_objects(cfg: ParsedConfig):
+    value_lookup = {}
+    for obj in cfg.objects:
+        if obj.get("value"):
+            value_lookup[obj["name"]] = obj["value"]
+
     for obj in cfg.objects:
         if obj.get("nat"):
+            resolved_value = obj["value"] or value_lookup.get(obj["name"], "")
             cfg.nat_rules.append({
                 "object_name": obj["name"],
-                "value": obj["value"],
+                "value": resolved_value,
                 "nat_line": obj["nat"],
                 "type": "object-nat",
                 "is_static_to_outside": "static" in obj["nat"] and "OUTSIDE" in obj["nat"],
