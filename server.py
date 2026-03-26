@@ -1208,5 +1208,253 @@ def run_security_assessment() -> dict:
     raise RuntimeError("No data source. Use connect_fmc or load_config_file first.")
 
 
+@mcp.tool()
+def generate_report_pdf(output_path: str = "/tmp/ftd_security_report.pdf") -> str:
+    """
+    Generate a PDF security assessment report. Runs the full assessment
+    and writes a formatted PDF to the given path.
+
+    Args:
+        output_path: Where to save the PDF (default: /tmp/ftd_security_report.pdf)
+    """
+    from fpdf import FPDF
+
+    def _safe(text: str) -> str:
+        return (text
+                .replace("\u2014", "--")
+                .replace("\u2013", "-")
+                .replace("\u2018", "'")
+                .replace("\u2019", "'")
+                .replace("\u201c", '"')
+                .replace("\u201d", '"')
+                .encode("latin-1", errors="replace")
+                .decode("latin-1"))
+
+    if not _parsed and not _fmc:
+        raise RuntimeError("No data source. Use connect_fmc or load_config_file first.")
+
+    if _parsed:
+        findings = _assess_config(_parsed)
+        hostname = _parsed.hostname
+        version = _parsed.asa_version
+        serial = _parsed.serial_number
+        mode = "File (show run)"
+        iface_count = len([i for i in _parsed.interfaces if i["nameif"]])
+        acl_count = len(_parsed.access_lists)
+        obj_count = len(_parsed.objects)
+    else:
+        result = _assess_fmc(_fmc)
+        findings = result.get("high_findings", []) + result.get("medium_findings", [])
+        hostname = "FMC Managed"
+        version = ""
+        serial = ""
+        mode = f"Live FMC ({_fmc.base_url})"
+        iface_count = 0
+        acl_count = 0
+        obj_count = 0
+
+    high = [f for f in findings if f["severity"] == "HIGH"]
+    medium = [f for f in findings if f["severity"] == "MEDIUM"]
+    low = [f for f in findings if f["severity"] == "LOW"]
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    DARK = (15, 23, 42)
+    WHITE = (255, 255, 255)
+    LIGHT_GRAY = (160, 174, 192)
+    RED = (239, 68, 68)
+    ORANGE = (255, 107, 53)
+    YELLOW = (250, 204, 21)
+    CYAN = (0, 212, 170)
+    BLUE = (0, 158, 247)
+    CARD_BG = (26, 35, 59)
+
+    class ReportPDF(FPDF):
+        def header(self):
+            self.set_fill_color(*DARK)
+            self.rect(0, 0, 210, 297, "F")
+            self.set_draw_color(*BLUE)
+            self.set_line_width(0.8)
+            self.line(0, 0, 210, 0)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font("Helvetica", "I", 8)
+            self.set_text_color(*LIGHT_GRAY)
+            self.cell(0, 10, f"FTD Security Assessment  |  {hostname}  |  Page {self.page_no()}/{{nb}}", align="C")
+            self.set_draw_color(*CYAN)
+            self.set_line_width(0.8)
+            self.line(0, 297, 210, 297)
+
+    pdf = ReportPDF()
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    pdf.add_page()
+    pdf.set_fill_color(*DARK)
+    pdf.rect(0, 0, 210, 297, "F")
+
+    pdf.set_draw_color(*BLUE)
+    pdf.set_line_width(1)
+    pdf.line(10, 50, 200, 50)
+    pdf.set_draw_color(*CYAN)
+    pdf.line(10, 52, 200, 52)
+
+    pdf.set_y(65)
+    pdf.set_font("Helvetica", "B", 32)
+    pdf.set_text_color(*WHITE)
+    pdf.cell(0, 15, "SECURITY ASSESSMENT", align="C", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 18)
+    pdf.set_text_color(*CYAN)
+    pdf.cell(0, 10, "Cisco FTD / ASA Firewall", align="C", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(15)
+    pdf.set_draw_color(*CARD_BG)
+    pdf.set_fill_color(*CARD_BG)
+    pdf.rect(25, pdf.get_y(), 160, 55, "F")
+
+    info_y = pdf.get_y() + 5
+    pdf.set_y(info_y)
+    info_items = [
+        ("Hostname:", hostname),
+        ("Version:", version),
+        ("Serial:", serial),
+        ("Source:", mode),
+        ("Generated:", timestamp),
+    ]
+    for label, value in info_items:
+        pdf.set_x(35)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(*LIGHT_GRAY)
+        pdf.cell(35, 8, label)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(0, 8, _safe(str(value)), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(15)
+
+    box_w = 50
+    box_h = 25
+    start_x = (210 - box_w * 3 - 10) / 2
+    box_y = pdf.get_y()
+
+    for i, (label, count, color) in enumerate([("HIGH", len(high), RED), ("MEDIUM", len(medium), ORANGE), ("LOW", len(low), YELLOW)]):
+        bx = start_x + i * (box_w + 5)
+        pdf.set_fill_color(*color)
+        pdf.rect(bx, box_y, box_w, box_h, "F")
+        pdf.set_xy(bx, box_y + 2)
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.set_text_color(*DARK)
+        pdf.cell(box_w, 12, str(count), align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_xy(bx, box_y + 14)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(box_w, 8, label, align="C")
+
+    pdf.ln(box_h + 10)
+    pdf.set_font("Helvetica", "I", 10)
+    pdf.set_text_color(*LIGHT_GRAY)
+    pdf.cell(0, 8, "Assessment based on CIS Benchmarks, Cisco hardening guides, and NIST SP 800-41", align="C")
+
+    def add_findings_section(severity_label, items, badge_color):
+        if not items:
+            return
+        pdf.add_page()
+
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(*badge_color)
+        pdf.cell(0, 12, f"{severity_label} FINDINGS ({len(items)})", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_draw_color(*badge_color)
+        pdf.set_line_width(0.6)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(5)
+
+        for idx, f in enumerate(items, 1):
+            space_needed = 35
+            if pdf.get_y() + space_needed > 275:
+                pdf.add_page()
+
+            card_y = pdf.get_y()
+            pdf.set_fill_color(*CARD_BG)
+            pdf.rect(10, card_y, 190, 30, "F")
+
+            pdf.set_fill_color(*badge_color)
+            pdf.rect(10, card_y, 3, 30, "F")
+
+            pdf.set_xy(16, card_y + 2)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(*badge_color)
+            pdf.cell(15, 6, f"#{idx}")
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(*WHITE)
+            pdf.cell(80, 6, _safe(f["check"]))
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(*LIGHT_GRAY)
+            pdf.cell(0, 6, _safe(f"[{f['category']}]"), align="R", new_x="LMARGIN", new_y="NEXT")
+
+            pdf.set_x(16)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*CYAN)
+            pdf.cell(15, 5, "Target:")
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(*WHITE)
+            pdf.cell(0, 5, _safe(f["target"]), new_x="LMARGIN", new_y="NEXT")
+
+            pdf.set_x(16)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.set_text_color(*LIGHT_GRAY)
+            detail = f["detail"]
+            if len(detail) > 120:
+                detail = detail[:117] + "..."
+            pdf.cell(180, 5, _safe(detail), new_x="LMARGIN", new_y="NEXT")
+
+            pdf.ln(4)
+
+    add_findings_section("HIGH", high, RED)
+    add_findings_section("MEDIUM", medium, ORANGE)
+    add_findings_section("LOW", low, YELLOW)
+
+    if _parsed:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.set_text_color(*BLUE)
+        pdf.cell(0, 12, "CONFIGURATION SUMMARY", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_draw_color(*BLUE)
+        pdf.set_line_width(0.6)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(8)
+
+        summary_items = [
+            ("Active Interfaces", str(iface_count)),
+            ("ACL Entries", str(acl_count)),
+            ("Network Objects", str(obj_count)),
+            ("NAT Rules", str(len(_parsed.nat_rules))),
+            ("IPSEC Proposals", str(len(_parsed.crypto_proposals))),
+            ("IKEv2 Policies", str(len(_parsed.ikev2_policies))),
+            ("Tunnel Groups", str(len(_parsed.tunnel_groups))),
+            ("Static Routes", str(len(_parsed.routes))),
+            ("Syslog Servers", str(len(_parsed.logging_config.get("syslog_servers", [])))),
+            ("NTP Servers", str(len(_parsed.ntp_servers))),
+            ("Local Users", str(len(_parsed.users))),
+        ]
+
+        for label, value in summary_items:
+            pdf.set_fill_color(*CARD_BG)
+            row_y = pdf.get_y()
+            pdf.rect(10, row_y, 190, 8, "F")
+            pdf.set_x(15)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(*LIGHT_GRAY)
+            pdf.cell(80, 8, label)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.set_text_color(*WHITE)
+            pdf.cell(0, 8, value, new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1)
+
+    pdf.output(output_path)
+    total = len(high) + len(medium) + len(low)
+    return f"PDF report saved to {output_path} ({total} findings: {len(high)} HIGH, {len(medium)} MEDIUM, {len(low)} LOW)"
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
