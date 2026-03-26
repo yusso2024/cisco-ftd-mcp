@@ -581,6 +581,11 @@ def _check_acls(cfg: ParsedConfig, findings: list[dict]):
                 "check": "Overly Permissive Rule",
                 "target": acl["acl_name"],
                 "detail": f"Permits {acl['protocol']} from any to any: {raw}",
+                "explanation": "This rule allows unrestricted traffic with no source or destination filtering. "
+                    "An attacker can exploit this for data exfiltration, C2 callbacks, or lateral movement. "
+                    "Every 'any any' rule effectively disables the firewall for that traffic type.",
+                "remediation": f"Remove this rule: no {raw}. Replace with specific source/destination/port rules "
+                    "that match legitimate business traffic only. Follow least-privilege principle.",
             })
 
         if action == "permit" and "eq 23" in raw:
@@ -590,6 +595,11 @@ def _check_acls(cfg: ParsedConfig, findings: list[dict]):
                 "check": "Telnet Permitted in ACL",
                 "target": acl["acl_name"],
                 "detail": f"Telnet (port 23) allowed: {raw}",
+                "explanation": "Telnet transmits all data including credentials in cleartext. Any network tap "
+                    "or man-in-the-middle can capture usernames, passwords, and session data. "
+                    "This is a direct violation of CIS Benchmark for Cisco firewalls.",
+                "remediation": f"Remove: no {raw}. Use SSH (port 22) for all remote management. "
+                    "If legacy devices require telnet, isolate them in a dedicated management VLAN.",
             })
 
         if action == "permit" and acl["protocol"] == "icmp" and "any any" in raw:
@@ -599,6 +609,12 @@ def _check_acls(cfg: ParsedConfig, findings: list[dict]):
                 "check": "Unrestricted ICMP",
                 "target": acl["acl_name"],
                 "detail": f"All ICMP from any to any permitted: {raw}",
+                "explanation": "Unrestricted ICMP from outside allows network reconnaissance (ping sweeps, "
+                    "traceroute mapping), ICMP-based attacks (Smurf, ping flood), and covert channels. "
+                    "Attackers use ICMP to map your network topology before launching targeted attacks.",
+                "remediation": "Replace with specific ICMP types: permit icmp any any echo-reply, "
+                    "permit icmp any any unreachable, permit icmp any any time-exceeded. "
+                    "Block echo (ping) from outside.",
             })
 
         if action == "permit" and acl["protocol"] == "ip":
@@ -612,6 +628,12 @@ def _check_acls(cfg: ParsedConfig, findings: list[dict]):
                         "check": "All-Ports Access Between Objects",
                         "target": acl["acl_name"],
                         "detail": f"IP (all ports) permitted between objects: {raw}",
+                        "explanation": "Allowing all IP protocols between two hosts means any service is reachable -- "
+                            "not just the intended application port. If the source host is compromised, the attacker "
+                            "has full network access to the destination (SSH, RDP, SMB, etc.).",
+                        "remediation": "Replace 'permit ip' with specific protocol and port: "
+                            "e.g., 'permit tcp <src> <dst> eq 3306' for MySQL. "
+                            "Only allow the exact ports needed for the application.",
                     })
 
 
@@ -628,6 +650,12 @@ def _check_nat(cfg: ParsedConfig, findings: list[dict]):
                         "check": "Internal Host Exposed to Outside",
                         "target": nat["object_name"],
                         "detail": f"Internal host {value} has static NAT to OUTSIDE: {nat['nat_line']}",
+                        "explanation": f"The internal host {value} is directly reachable from the internet via "
+                            "static NAT. Any vulnerability on this host (unpatched service, weak credentials, "
+                            "SQL injection) is directly exploitable from outside your network.",
+                        "remediation": f"Remove: no {nat['nat_line']} under object network {nat['object_name']}. "
+                            "If external access is required, place a reverse proxy or load balancer in the DMZ "
+                            "and restrict inbound traffic to specific ports only.",
                     })
 
 
@@ -641,7 +669,12 @@ def _check_crypto(cfg: ParsedConfig, findings: list[dict]):
                 "category": "VPN Crypto",
                 "check": "Weak Encryption Algorithm",
                 "target": f"IPSEC proposal {prop['name']}",
-                "detail": f"Uses {enc.upper()} — compromised, use AES-256",
+                "detail": f"Uses {enc.upper()} -- compromised, use AES-256",
+                "explanation": f"{enc.upper()} is a 56-bit cipher that can be brute-forced in hours with modern "
+                    "hardware. Any VPN tunnel negotiating this proposal can be decrypted by an attacker "
+                    "capturing the traffic. NIST deprecated DES in 2005.",
+                "remediation": f"Remove the proposal: no crypto ipsec ikev2 ipsec-proposal {prop['name']}. "
+                    "Ensure all peers use AES-256 with SHA-256 or higher.",
             })
         if integ in WEAK_INTEGRITY:
             findings.append({
@@ -649,7 +682,12 @@ def _check_crypto(cfg: ParsedConfig, findings: list[dict]):
                 "category": "VPN Crypto",
                 "check": "Weak Integrity Algorithm",
                 "target": f"IPSEC proposal {prop['name']}",
-                "detail": f"Uses {integ.upper()} — collision attacks known, use SHA-256+",
+                "detail": f"Uses {integ.upper()} -- collision attacks known, use SHA-256+",
+                "explanation": f"{integ.upper()} has known collision vulnerabilities since 2004. An attacker can "
+                    "forge packets that pass integrity checks, enabling injection of malicious traffic "
+                    "into the VPN tunnel without detection.",
+                "remediation": f"Remove: no crypto ipsec ikev2 ipsec-proposal {prop['name']}. "
+                    "Use SHA-256, SHA-384, or SHA-512 for integrity.",
             })
 
     for pol in cfg.ikev2_policies:
@@ -662,7 +700,12 @@ def _check_crypto(cfg: ParsedConfig, findings: list[dict]):
                 "category": "VPN Crypto",
                 "check": "Weak IKEv2 Encryption",
                 "target": f"IKEv2 policy {pol['priority']}",
-                "detail": f"Uses {enc.upper()} — must upgrade to AES-256",
+                "detail": f"Uses {enc.upper()} -- must upgrade to AES-256",
+                "explanation": f"IKEv2 policy {pol['priority']} negotiates the key exchange using {enc.upper()}, "
+                    "a broken cipher. The entire VPN session key derivation is compromised if this "
+                    "policy is selected during negotiation.",
+                "remediation": f"Remove: no crypto ikev2 policy {pol['priority']}. "
+                    "The strong policy (AES-256) will be used instead.",
             })
         if integ in WEAK_INTEGRITY:
             findings.append({
@@ -670,7 +713,11 @@ def _check_crypto(cfg: ParsedConfig, findings: list[dict]):
                 "category": "VPN Crypto",
                 "check": "Weak IKEv2 Integrity",
                 "target": f"IKEv2 policy {pol['priority']}",
-                "detail": f"Uses {integ.upper()} — collision-vulnerable",
+                "detail": f"Uses {integ.upper()} -- collision-vulnerable",
+                "explanation": f"{integ.upper()} integrity in IKEv2 means key exchange messages can be tampered with. "
+                    "An attacker performing a man-in-the-middle can manipulate the Diffie-Hellman exchange "
+                    "and potentially downgrade or hijack the VPN session.",
+                "remediation": f"Remove: no crypto ikev2 policy {pol['priority']}. Use SHA-256+ for integrity.",
             })
         if dh in WEAK_DH_GROUPS:
             findings.append({
@@ -678,7 +725,12 @@ def _check_crypto(cfg: ParsedConfig, findings: list[dict]):
                 "category": "VPN Crypto",
                 "check": "Weak Diffie-Hellman Group",
                 "target": f"IKEv2 policy {pol['priority']}",
-                "detail": f"DH group {dh} (<=1024-bit) — factorable, use group 19+ (ECDH)",
+                "detail": f"DH group {dh} (<=1024-bit) -- factorable, use group 19+ (ECDH)",
+                "explanation": f"DH group {dh} uses a 1024-bit or smaller key. Academic research (Logjam attack, 2015) "
+                    "demonstrated that nation-state actors can factor 1024-bit DH in real time. "
+                    "All traffic protected by this group should be considered interceptable.",
+                "remediation": f"Remove: no crypto ikev2 policy {pol['priority']}. "
+                    "Use DH group 19 (256-bit ECDH) or group 21 (521-bit ECDH) for key exchange.",
             })
 
 
@@ -691,6 +743,11 @@ def _check_logging(cfg: ParsedConfig, findings: list[dict]):
             "check": "Logging Disabled",
             "target": "Global",
             "detail": "No 'logging enable' found",
+            "explanation": "Without logging, there is zero visibility into firewall activity. Security incidents, "
+                "policy violations, and configuration changes go completely unrecorded. Incident response "
+                "and forensic analysis become impossible.",
+            "remediation": "Enable logging: logging enable. Set level to informational: logging buffered informational. "
+                "Configure a syslog server: logging host INSIDE <syslog-ip>.",
         })
         return
 
@@ -702,7 +759,12 @@ def _check_logging(cfg: ParsedConfig, findings: list[dict]):
             "category": "Logging",
             "check": "Insufficient Logging Level",
             "target": "logging buffered",
-            "detail": f"Level '{level}' misses warnings and notifications — use 'informational' or 'notifications'",
+            "detail": f"Level '{level}' misses warnings and notifications -- use 'informational' or 'notifications'",
+            "explanation": f"At level '{level}', the firewall only logs severe events. Warning-level events like "
+                "connection denials, VPN negotiation failures, and rate limiting are not recorded. "
+                "Most security-relevant events occur at warning/notification level.",
+            "remediation": f"Increase: logging buffered informational. Also set: logging trap informational "
+                "to send the same level to syslog.",
         })
 
     if not log.get("syslog_servers"):
@@ -711,7 +773,12 @@ def _check_logging(cfg: ParsedConfig, findings: list[dict]):
             "category": "Logging",
             "check": "No Syslog Server",
             "target": "Global",
-            "detail": "No 'logging host' configured — logs only stored locally, lost on reboot/failure",
+            "detail": "No 'logging host' configured -- logs only stored locally, lost on reboot/failure",
+            "explanation": "Logs stored only in the firewall's buffer are lost on reboot, crash, or buffer overflow. "
+                "An attacker who gains access can clear them. Compliance frameworks (PCI-DSS, SOC 2, HIPAA) "
+                "require centralized, tamper-resistant log collection.",
+            "remediation": "Configure: logging host INSIDE <syslog-server-ip>. Use a SIEM (Splunk, ELK, etc.) "
+                "for centralized collection. Set logging trap informational to forward all relevant events.",
         })
 
 
@@ -723,7 +790,12 @@ def _check_management_access(cfg: ParsedConfig, findings: list[dict]):
                 "category": "Management Access",
                 "check": "Unrestricted SSH Access",
                 "target": f"SSH on {entry['interface']}",
-                "detail": f"SSH open to 0.0.0.0/0 on {entry['interface']} — restrict to management subnet",
+                "detail": f"SSH open to 0.0.0.0/0 on {entry['interface']} -- restrict to management subnet",
+                "explanation": f"Every host on {entry['interface']} can attempt SSH login to the firewall. "
+                    "If any internal host is compromised, the attacker has a direct path to the firewall's "
+                    "management plane. Brute-force and credential-stuffing attacks become trivial.",
+                "remediation": f"Remove: no ssh 0.0.0.0 0.0.0.0 {entry['interface']}. "
+                    "Allow SSH only from the management subnet: ssh 192.168.1.0 255.255.255.0 MGMT.",
             })
 
     for entry in cfg.http_access:
@@ -733,7 +805,12 @@ def _check_management_access(cfg: ParsedConfig, findings: list[dict]):
                 "category": "Management Access",
                 "check": "Unrestricted ASDM/HTTP Access",
                 "target": f"HTTP on {entry['interface']}",
-                "detail": f"ASDM open to 0.0.0.0/0 on {entry['interface']} — restrict to management subnet",
+                "detail": f"ASDM open to 0.0.0.0/0 on {entry['interface']} -- restrict to management subnet",
+                "explanation": f"ASDM (Adaptive Security Device Manager) provides full GUI admin access to the "
+                    f"firewall. Open to all hosts on {entry['interface']}, it exposes the entire configuration "
+                    f"to any compromised internal machine. ASDM has had known CVEs in past versions.",
+                "remediation": f"Remove: no http 0.0.0.0 0.0.0.0 {entry['interface']}. "
+                    "Allow only: http 192.168.1.0 255.255.255.0 MGMT.",
             })
 
 
@@ -747,7 +824,13 @@ def _check_snmp(cfg: ParsedConfig, findings: list[dict]):
                 "category": "SNMP",
                 "check": "Default SNMP Community String",
                 "target": f"community '{comm}'",
-                "detail": f"Default community '{comm}' — trivially guessable, use SNMPv3 or unique strings",
+                "detail": f"Default community '{comm}' -- trivially guessable, use SNMPv3 or unique strings",
+                "explanation": f"The community string '{comm}' is the first thing any scanner tries. With read "
+                    "access, an attacker can enumerate the entire device configuration, ARP tables, "
+                    "routing tables, and interface statistics. With 'private' (read-write), they can modify config.",
+                "remediation": f"Remove: no snmp-server community {comm}. Migrate to SNMPv3 with "
+                    "authPriv (authentication + encryption): snmp-server group MYGROUP v3 priv. "
+                    "Create a user: snmp-server user MYUSER MYGROUP v3 auth sha <key> priv aes 256 <key>.",
             })
 
     if communities and not any(c.strip('"') not in default_communities for c in communities):
@@ -756,7 +839,12 @@ def _check_snmp(cfg: ParsedConfig, findings: list[dict]):
             "category": "SNMP",
             "check": "SNMPv2c Only",
             "target": "SNMP config",
-            "detail": "Only SNMPv2c community strings found — migrate to SNMPv3 for auth + encryption",
+            "detail": "Only SNMPv2c community strings found -- migrate to SNMPv3 for auth + encryption",
+            "explanation": "SNMPv2c sends community strings in cleartext over the network. Anyone sniffing traffic "
+                "can capture the community string and gain full SNMP access. SNMPv3 adds authentication "
+                "(SHA) and encryption (AES) to prevent interception.",
+            "remediation": "Migrate to SNMPv3: snmp-server group MYGROUP v3 priv. "
+                "Remove all v2c communities: no snmp-server community public, no snmp-server community private.",
         })
 
 
@@ -770,7 +858,12 @@ def _check_ntp(cfg: ParsedConfig, findings: list[dict]):
                 "category": "NTP",
                 "check": "Unauthenticated NTP",
                 "target": servers,
-                "detail": "NTP servers configured without authentication — vulnerable to time-spoofing attacks",
+                "detail": "NTP servers configured without authentication -- vulnerable to time-spoofing attacks",
+                "explanation": "Without NTP authentication, an attacker can spoof NTP responses to shift the firewall's "
+                    "clock. This breaks certificate validation (expired/not-yet-valid certs accepted), "
+                    "corrupts log timestamps for forensics, and can disrupt VPN IKE negotiations.",
+                "remediation": "Configure NTP authentication: ntp authenticate, ntp authentication-key 1 md5 <secret>, "
+                    "ntp trusted-key 1, ntp server <ip> key 1. Or use NTS (Network Time Security) if supported.",
             })
     else:
         findings.append({
@@ -778,7 +871,12 @@ def _check_ntp(cfg: ParsedConfig, findings: list[dict]):
             "category": "NTP",
             "check": "No NTP Configured",
             "target": "Global",
-            "detail": "No NTP servers — time drift affects logging, certificates, and VPN",
+            "detail": "No NTP servers -- time drift affects logging, certificates, and VPN",
+            "explanation": "Without NTP, the firewall clock drifts, causing log timestamp inaccuracies, "
+                "certificate validation failures, and IKE/IPsec SA lifetime mismatches. "
+                "Incident response becomes unreliable when timestamps don't correlate across devices.",
+            "remediation": "Configure at least two NTP servers: ntp server <primary-ip>, ntp server <secondary-ip>. "
+                "Enable authentication for integrity.",
         })
 
 
@@ -791,7 +889,12 @@ def _check_telnet(cfg: ParsedConfig, findings: list[dict]):
                 "check": "Telnet Enabled",
                 "target": f"Telnet on {entry['interface']}",
                 "detail": f"Telnet from {entry['network']}/{entry['mask']} on {entry['interface']} "
-                          f"— cleartext protocol, credentials exposed on wire",
+                          f"-- cleartext protocol, credentials exposed on wire",
+                "explanation": "Telnet sends all data including admin credentials in plaintext. Any device on the "
+                    f"same network segment as {entry['interface']} can capture login sessions with a packet "
+                    "sniffer (Wireshark, tcpdump). This is a critical violation of every security framework.",
+                "remediation": f"Remove immediately: no telnet {entry['network']} {entry['mask']} {entry['interface']}. "
+                    "Use SSH exclusively for CLI management. Verify: ssh version 2.",
             })
 
 
@@ -817,7 +920,12 @@ def _check_vpn_remote_access(cfg: ParsedConfig, findings: list[dict]):
             "category": "Remote Access VPN",
             "check": "No VPN Idle Timeout",
             "target": gp.get("name", "group-policy"),
-            "detail": "No idle-timeout configured — abandoned sessions remain open indefinitely",
+            "detail": "No idle-timeout configured -- abandoned sessions remain open indefinitely",
+            "explanation": "Without an idle timeout, VPN sessions from laptops left open at coffee shops, "
+                "lost/stolen devices, or forgotten connections remain active indefinitely. "
+                "An attacker with access to an abandoned session has full network access.",
+            "remediation": "Add to group-policy: vpn-idle-timeout 30 (30 minutes). "
+                "Also consider: vpn-session-timeout 480 (8 hour max session).",
         })
 
 
@@ -830,7 +938,12 @@ def _check_unused_objects(cfg: ParsedConfig, findings: list[dict]):
                 "category": "Hygiene",
                 "check": "Stale Object Group",
                 "target": grp["name"],
-                "detail": f"Object group described as '{grp['description']}' — consider removing",
+                "detail": f"Object group described as '{grp['description']}' -- consider removing",
+                "explanation": "Stale objects create confusion during audits, increase config complexity, "
+                    "and risk accidental inclusion in new ACL rules. Clean configurations are easier "
+                    "to audit and less prone to misconfiguration.",
+                "remediation": f"Verify the group is truly unused: show access-list | include {grp['name']}. "
+                    f"If no references: no object-group network {grp['name']}.",
             })
 
 
@@ -1370,18 +1483,30 @@ def generate_report_pdf(output_path: str = "/tmp/ftd_security_report.pdf") -> st
         pdf.ln(5)
 
         for idx, f in enumerate(items, 1):
-            space_needed = 35
-            if pdf.get_y() + space_needed > 275:
+            has_explanation = f.get("explanation")
+            has_remediation = f.get("remediation")
+
+            lines_detail = pdf.multi_cell(180, 4, _safe(f["detail"]), dry_run=True, output="LINES")
+            height_est = 18 + len(lines_detail) * 4
+            if has_explanation:
+                lines_exp = pdf.multi_cell(180, 4, _safe("RISK: " + f["explanation"]), dry_run=True, output="LINES")
+                height_est += 5 + len(lines_exp) * 4
+            if has_remediation:
+                lines_rem = pdf.multi_cell(180, 4, _safe("FIX: " + f["remediation"]), dry_run=True, output="LINES")
+                height_est += 5 + len(lines_rem) * 4
+            height_est += 8
+
+            if pdf.get_y() + height_est > 275:
                 pdf.add_page()
 
-            card_y = pdf.get_y()
+            card_start_y = pdf.get_y()
+
             pdf.set_fill_color(*CARD_BG)
-            pdf.rect(10, card_y, 190, 30, "F")
-
+            pdf.rect(10, card_start_y, 190, height_est, "F")
             pdf.set_fill_color(*badge_color)
-            pdf.rect(10, card_y, 3, 30, "F")
+            pdf.rect(10, card_start_y, 3, height_est, "F")
 
-            pdf.set_xy(16, card_y + 2)
+            pdf.set_xy(16, card_start_y + 2)
             pdf.set_font("Helvetica", "B", 10)
             pdf.set_text_color(*badge_color)
             pdf.cell(15, 6, f"#{idx}")
@@ -1401,14 +1526,25 @@ def generate_report_pdf(output_path: str = "/tmp/ftd_security_report.pdf") -> st
             pdf.cell(0, 5, _safe(f["target"]), new_x="LMARGIN", new_y="NEXT")
 
             pdf.set_x(16)
-            pdf.set_font("Helvetica", "", 9)
+            pdf.set_font("Helvetica", "", 8)
             pdf.set_text_color(*LIGHT_GRAY)
-            detail = f["detail"]
-            if len(detail) > 120:
-                detail = detail[:117] + "..."
-            pdf.cell(180, 5, _safe(detail), new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(180, 4, _safe(f["detail"]), new_x="LMARGIN", new_y="NEXT")
 
-            pdf.ln(4)
+            if has_explanation:
+                pdf.ln(1)
+                pdf.set_x(16)
+                pdf.set_font("Helvetica", "B", 8)
+                pdf.set_text_color(255, 200, 100)
+                pdf.multi_cell(180, 4, _safe("RISK: " + f["explanation"]), new_x="LMARGIN", new_y="NEXT")
+
+            if has_remediation:
+                pdf.ln(1)
+                pdf.set_x(16)
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(100, 220, 180)
+                pdf.multi_cell(180, 4, _safe("FIX: " + f["remediation"]), new_x="LMARGIN", new_y="NEXT")
+
+            pdf.set_y(card_start_y + height_est + 4)
 
     add_findings_section("HIGH", high, RED)
     add_findings_section("MEDIUM", medium, ORANGE)
