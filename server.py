@@ -36,6 +36,7 @@ mcp = FastMCP(name="cisco-ftd-assessment")
 @dataclass
 class ParsedConfig:
     source: str = ""
+    vendor: str = "cisco-ftd"
     hostname: str = ""
     asa_version: str = ""
     serial_number: str = ""
@@ -129,8 +130,18 @@ WEAK_INTEGRITY = {"md5"}
 WEAK_DH_GROUPS = {"1", "2", "5"}
 
 
+def _looks_like_fortigate(text: str) -> bool:
+    indicators = (
+        "config system global",
+        "config firewall policy",
+        "config vpn ipsec phase1-interface",
+        "config-version=",
+    )
+    return sum(1 for i in indicators if i in text) >= 2
+
+
 def parse_ftd_config(text: str) -> ParsedConfig:
-    cfg = ParsedConfig(source="file", raw_text=text)
+    cfg = ParsedConfig(source="file", vendor="cisco-ftd", raw_text=text)
     lines = text.splitlines()
 
     serial_match = re.search(r"Serial Number:\s*(.+)", text)
@@ -248,6 +259,254 @@ def parse_ftd_config(text: str) -> ParsedConfig:
 
     _collect_nat_from_objects(cfg)
     return cfg
+
+
+def parse_fortigate_config(text: str) -> ParsedConfig:
+    cfg = ParsedConfig(source="file", vendor="fortigate", raw_text=text)
+    lines = text.splitlines()
+
+    version_match = re.search(r"config-version=.*?[-v](\d+\.\d+\.\d+)", text)
+    if version_match:
+        cfg.asa_version = version_match.group(1)
+
+    hostname_match = re.search(r"set\s+hostname\s+\"?([^\"\n]+)\"?", text)
+    if hostname_match:
+        cfg.hostname = hostname_match.group(1).strip()
+
+    interfaces = _extract_fgt_edit_blocks(lines, "config system interface")
+    for block in interfaces:
+        iface_name = block["name"]
+        ip = ""
+        mask = ""
+        allowaccess = []
+        for line in block["lines"]:
+            if line.startswith("set ip "):
+                parts = line.split()
+                ip = parts[2] if len(parts) > 2 else ""
+                mask = parts[3] if len(parts) > 3 else ""
+            elif line.startswith("set allowaccess "):
+                allowaccess = line.split()[2:]
+
+        cfg.interfaces.append({
+            "name": iface_name,
+            "nameif": iface_name,
+            "security_level": -1,
+            "ip": ip,
+            "mask": mask,
+            "shutdown": False,
+            "management_only": False,
+            "allowaccess": allowaccess,
+        })
+
+        is_wan = any(token in iface_name.lower() for token in ("wan", "outside", "ext"))
+        if "ssh" in allowaccess and is_wan:
+            cfg.ssh_access.append({"protocol": "ssh", "network": "0.0.0.0", "mask": "0.0.0.0", "interface": iface_name})
+        if any(proto in allowaccess for proto in ("http", "https")) and is_wan:
+            cfg.http_access.append({"protocol": "http", "network": "0.0.0.0", "mask": "0.0.0.0", "interface": iface_name})
+        if "telnet" in allowaccess:
+            cfg.telnet_access.append({"network": "0.0.0.0", "mask": "0.0.0.0", "interface": iface_name})
+
+    addresses = _extract_fgt_edit_blocks(lines, "config firewall address")
+    for block in addresses:
+        value = ""
+        subtype = ""
+        for line in block["lines"]:
+            if line.startswith("set subnet "):
+                value = " ".join(line.split()[2:4])
+                subtype = "subnet"
+        cfg.objects.append({"name": block["name"], "type": "network", "value": value, "subtype": subtype, "nat": None})
+
+    addr_groups = _extract_fgt_edit_blocks(lines, "config firewall addrgrp")
+    for block in addr_groups:
+        desc = ""
+        members = []
+        for line in block["lines"]:
+            if line.startswith("set comment ") or line.startswith("set description "):
+                desc = line.split(None, 2)[-1].strip('"')
+            elif line.startswith("set member "):
+                members = re.findall(r'"([^"]+)"', line)
+        cfg.object_groups.append({"type": "network", "name": block["name"], "members": members, "description": desc})
+
+    policies = _extract_fgt_edit_blocks(lines, "config firewall policy")
+    for block in policies:
+        policy_id = block["name"]
+        action = ""
+        srcaddr = []
+        dstaddr = []
+        services = []
+        nat_enabled = False
+        for line in block["lines"]:
+            if line.startswith("set action "):
+                action = line.split()[-1].lower()
+            elif line.startswith("set srcaddr "):
+                srcaddr = re.findall(r'"([^"]+)"', line)
+            elif line.startswith("set dstaddr "):
+                dstaddr = re.findall(r'"([^"]+)"', line)
+            elif line.startswith("set service "):
+                services = re.findall(r'"([^"]+)"', line)
+            elif line.startswith("set nat "):
+                nat_enabled = line.split()[-1].lower() == "enable"
+
+        if action == "accept":
+            src_any = len(srcaddr) == 0 or "all" in [s.lower() for s in srcaddr]
+            dst_any = len(dstaddr) == 0 or "all" in [d.lower() for d in dstaddr]
+            svc_upper = [s.upper() for s in services]
+            protocol = "ip" if "ALL" in svc_upper or not services else "tcp"
+            raw = f"fortigate policy {policy_id} accept src={srcaddr or ['all']} dst={dstaddr or ['all']} svc={services or ['ALL']}"
+            if "TELNET" in svc_upper:
+                raw += " eq 23"
+            cfg.access_lists.append({
+                "acl_name": f"FGT-POLICY-{policy_id}",
+                "type": "extended",
+                "action": "permit",
+                "protocol": protocol,
+                "raw": raw,
+                "source": "any" if src_any else "",
+                "destination": "any" if dst_any else "",
+                "port": "eq 23" if "TELNET" in svc_upper else "",
+                "source_and_dest": raw,
+            })
+
+            if nat_enabled and src_any and dst_any:
+                cfg.nat_rules.append({
+                    "object_name": f"policy-{policy_id}",
+                    "value": "",
+                    "nat_line": f"policy {policy_id} set nat enable",
+                    "type": "policy-nat",
+                    "is_static_to_outside": False,
+                })
+
+    vips = _extract_fgt_edit_blocks(lines, "config firewall vip")
+    for block in vips:
+        extip = ""
+        mappedip = ""
+        for line in block["lines"]:
+            if line.startswith("set extip "):
+                extip = line.split()[-1].strip('"')
+            elif line.startswith("set mappedip "):
+                matches = re.findall(r'"([^"]+)"', line)
+                mappedip = matches[0] if matches else ""
+        if extip and mappedip:
+            cfg.nat_rules.append({
+                "object_name": block["name"],
+                "value": mappedip,
+                "nat_line": f"vip {block['name']} extip {extip} mappedip {mappedip}",
+                "type": "object-nat",
+                "is_static_to_outside": True,
+            })
+
+    phase1 = _extract_fgt_edit_blocks(lines, "config vpn ipsec phase1-interface")
+    for block in phase1:
+        proposal = ""
+        dhgrp = ""
+        for line in block["lines"]:
+            if line.startswith("set proposal "):
+                proposal = line.split("set proposal ", 1)[1].strip().split()[0]
+            elif line.startswith("set dhgrp "):
+                dhgrp = line.split()[-1]
+        if proposal:
+            parts = proposal.split("-")
+            enc = parts[0] if parts else ""
+            integ = parts[1] if len(parts) > 1 else ""
+            cfg.ikev2_policies.append({
+                "priority": block["name"],
+                "encryption": enc,
+                "integrity": integ,
+                "dh_group": dhgrp,
+                "prf": "",
+                "lifetime": "",
+            })
+            cfg.crypto_proposals.append({"name": f"phase1-{block['name']}", "encryption": enc, "integrity": integ})
+
+    log_settings = _extract_fgt_plain_section(lines, "config log syslogd setting")
+    if log_settings:
+        status = _fgt_get_set_value(log_settings, "status")
+        if status == "enable":
+            cfg.logging_config["enabled"] = True
+            server = _fgt_get_set_value(log_settings, "server")
+            if server:
+                cfg.logging_config["syslog_servers"] = [[server]]
+        else:
+            cfg.logging_config["enabled"] = False
+
+    snmp_blocks = _extract_fgt_edit_blocks(lines, "config system snmp community")
+    communities = []
+    for block in snmp_blocks:
+        name_value = _fgt_get_set_value(block["lines"], "name")
+        if name_value:
+            communities.append(name_value.strip('"'))
+    if communities:
+        cfg.snmp_config["communities"] = communities
+
+    ntp_settings = _extract_fgt_plain_section(lines, "config system ntp")
+    if ntp_settings:
+        ntpsync = _fgt_get_set_value(ntp_settings, "ntpsync")
+        ntp_servers = _extract_fgt_edit_blocks(lines, "config system ntpserver")
+        for block in ntp_servers:
+            srv = _fgt_get_set_value(block["lines"], "server")
+            if srv:
+                cfg.ntp_servers.append({"server": srv.strip('"'), "authenticated": False if ntpsync == "enable" else False})
+
+    admins = _extract_fgt_edit_blocks(lines, "config system admin")
+    for block in admins:
+        cfg.users.append({"name": block["name"], "privilege": 15})
+
+    return cfg
+
+
+def _extract_fgt_edit_blocks(lines: list[str], section_header: str) -> list[dict]:
+    blocks = []
+    in_section = False
+    current = None
+    for raw in lines:
+        line = raw.strip()
+        if line == section_header:
+            in_section = True
+            current = None
+            continue
+        if not in_section:
+            continue
+        if line == "end":
+            if current:
+                blocks.append(current)
+            break
+        if line.startswith("edit "):
+            if current:
+                blocks.append(current)
+            name = line.split("edit ", 1)[1].strip().strip('"')
+            current = {"name": name, "lines": []}
+            continue
+        if line == "next":
+            if current:
+                blocks.append(current)
+                current = None
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    return blocks
+
+
+def _extract_fgt_plain_section(lines: list[str], section_header: str) -> list[str]:
+    in_section = False
+    out = []
+    for raw in lines:
+        line = raw.strip()
+        if line == section_header:
+            in_section = True
+            continue
+        if in_section and line == "end":
+            break
+        if in_section:
+            out.append(line)
+    return out
+
+
+def _fgt_get_set_value(lines: list[str], key: str) -> str:
+    prefix = f"set {key} "
+    for line in lines:
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ""
 
 
 def _parse_interface(lines: list[str], start: int) -> dict:
@@ -565,6 +824,9 @@ def _assess_config(cfg: ParsedConfig) -> list[dict]:
     _check_interfaces(cfg, findings)
     _check_vpn_remote_access(cfg, findings)
     _check_unused_objects(cfg, findings)
+
+    if cfg.vendor == "fortigate":
+        _check_fortigate_specific(cfg, findings)
 
     return findings
 
@@ -947,6 +1209,24 @@ def _check_unused_objects(cfg: ParsedConfig, findings: list[dict]):
             })
 
 
+def _check_fortigate_specific(cfg: ParsedConfig, findings: list[dict]):
+    if cfg.asa_version:
+        version_parts = [p for p in cfg.asa_version.split(".") if p.isdigit()]
+        parsed = tuple(int(p) for p in version_parts)
+        if parsed and parsed < (7, 2, 0):
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "Platform",
+                "check": "Potentially Outdated FortiOS",
+                "target": cfg.hostname or "fortigate",
+                "detail": f"FortiOS version {cfg.asa_version} appears older than recommended baseline",
+                "explanation": "Older FortiOS versions accumulate publicly known CVEs that can lead to remote "
+                    "code execution, authentication bypass, or privilege escalation on the firewall.",
+                "remediation": "Review Fortinet PSIRT advisories for your exact build and upgrade to a "
+                    "vendor-recommended supported release train.",
+            })
+
+
 # =========================================================================
 #  FMC API ASSESSMENT (original mode)
 # =========================================================================
@@ -1074,12 +1354,17 @@ def load_config_file(file_path: str) -> str:
         raise FileNotFoundError(f"Config file not found: {file_path}")
     _fmc = None
     text = path.read_text()
-    _parsed = parse_ftd_config(text)
+    if _looks_like_fortigate(text):
+        _parsed = parse_fortigate_config(text)
+    else:
+        _parsed = parse_ftd_config(text)
     iface_count = len([i for i in _parsed.interfaces if i["nameif"]])
     acl_count = len(_parsed.access_lists)
     obj_count = len(_parsed.objects)
+    vendor_name = "FortiGate" if _parsed.vendor == "fortigate" else "Cisco FTD/ASA"
     return (
         f"FILE MODE — Loaded {path.name}\n"
+        f"  Vendor:     {vendor_name}\n"
         f"  Hostname:   {_parsed.hostname}\n"
         f"  Version:    {_parsed.asa_version}\n"
         f"  Serial:     {_parsed.serial_number}\n"
@@ -1090,11 +1375,40 @@ def load_config_file(file_path: str) -> str:
 
 
 @mcp.tool()
+def load_fortigate_config_file(file_path: str) -> str:
+    """
+    [FILE MODE] Load and parse a FortiGate text config from disk.
+
+    Args:
+        file_path: Absolute path to the FortiGate config file
+    """
+    global _fmc, _parsed
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {file_path}")
+    _fmc = None
+    text = path.read_text()
+    _parsed = parse_fortigate_config(text)
+    iface_count = len([i for i in _parsed.interfaces if i["nameif"]])
+    pol_count = len(_parsed.access_lists)
+    obj_count = len(_parsed.objects)
+    return (
+        f"FILE MODE — Loaded FortiGate {path.name}\n"
+        f"  Hostname:   {_parsed.hostname}\n"
+        f"  Version:    {_parsed.asa_version}\n"
+        f"  Interfaces: {iface_count} active\n"
+        f"  Policy entries: {pol_count}\n"
+        f"  Objects:    {obj_count}"
+    )
+
+
+@mcp.tool()
 def get_mode() -> str:
     """Show which mode is active: file, fmc, or none."""
     mode = _active_mode()
     if mode == "file":
-        return f"FILE MODE — {_parsed.hostname} ({_parsed.asa_version})"
+        vendor_name = "FortiGate" if _parsed.vendor == "fortigate" else "Cisco FTD/ASA"
+        return f"FILE MODE — {vendor_name} {_parsed.hostname} ({_parsed.asa_version})"
     if mode == "fmc":
         return f"LIVE MODE — FMC at {_fmc.base_url}"
     return "No data source loaded. Use connect_fmc or load_config_file first."
@@ -1122,6 +1436,7 @@ def list_devices() -> list[dict]:
             "version": _parsed.asa_version,
             "serial": _parsed.serial_number,
             "hardware": _parsed.hardware,
+            "vendor": _parsed.vendor,
             "source": "config file",
         }]
     if _fmc:
